@@ -1,0 +1,2813 @@
+BigMem 多层记忆系统设计方案
+1. 需求分析与设计目标
+1.1 核心问题
+问题维度	当前状态	目标状态
+记忆召回完整性	单一向量搜索，漏召回	向量+关键词+关系图谱多路召回
+记忆准确性	语义相似但可能偏颇	融合排序 + 交叉验证
+记忆连续性	文件散落，缺乏关联	层级关联 + 时间链
+记忆关联性	记忆间无关联	知识图谱 + 双向索引
+非结构化数据关联	缺失	文件元数据 + 语义关联
+1.2 数据层级设计
+┌─────────────────────────────────────────────────────────────────────┐
+│                         长期记忆层                                   │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │
+│  │  经验教训       │  │  提炼记忆       │  │  项目文档           │ │
+│  │  (简短、永久)   │  │  (1周/1月提炼)  │  │  (代码/排查记录)    │ │
+│  └────────┬────────┘  └────────┬────────┘  └──────────┬──────────┘ │
+└───────────┼─────────────────────┼──────────────────────┼───────────┘
+            │                     │                      │
+            ▼                     ▼                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         短期记忆层                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                     每日记忆 (原始、追加)                        ││
+│  │  memory/2026-03-19.md → 原子化存储 → 关联到 Todo/项目           ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         实体数据层                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐│
+│  │  待办    │  │  已完成  │  │ 文件元数据│  │  用户描述/标签       ││
+│  │  (有日期)│  │  (有时序)│  │ (多媒体)  │  │  (隐性需求挖掘)      ││
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+2. 数据模型设计
+2.1 核心表结构
+2.1.1 记忆原子表 (memory_atoms)
+CREATE TABLE memory_atoms (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    atom_type       ATOM_TYPE_ENUM NOT NULL,  -- raw_daily, refined_weekly, lesson, project_doc
+    content         TEXT NOT NULL,             -- 原始/提炼内容
+    embedding       vector(1536),              -- 语义向量 (text-embedding-3-small)
+    
+    -- 层级关系
+    source_date     DATE,                      -- 原始日期 (raw_daily用)
+    refined_period  VARCHAR(20),               -- 提炼周期: weekly/monthly
+    refined_from    UUID[],                    -- 原始记忆ID列表
+    
+    -- 元数据
+    metadata        JSONB,                     -- 动态元数据
+    tags            TEXT[],
+    importance      FLOAT DEFAULT 0.5,         -- 重要性 0-1
+    
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- 向量索引 (HNSW)
+CREATE INDEX idx_atoms_embedding ON memory_atoms USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX idx_atoms_type ON memory_atoms(atom_type);
+CREATE INDEX idx_atoms_date ON memory_atoms(source_date);
+2.1.2 关联关系表 (memory_links)
+CREATE TABLE memory_links (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id       UUID REFERENCES memory_atoms(id),
+    target_id       UUID REFERENCES memory_atoms(id),
+    
+    link_type       LINK_TYPE_ENUM NOT NULL,   -- derived(提炼), related(相关), 
+                                                -- verified(验证), part_of(属于), 
+                                                -- blocks(阻塞/冲突), references(引用)
+    strength        FLOAT DEFAULT 0.5,         -- 关联强度 0-1
+    
+    -- 验证关系专用
+    verification_status VARCHAR(20),           -- pending, confirmed, rejected
+    verified_by_todo_id UUID,                  -- 通过哪个Todo验证
+    
+    context         TEXT,                      -- 关联上下文说明
+    created_at      TIMESTAMP DEFAULT NOW(),
+    
+    UNIQUE(source_id, target_id, link_type)
+);
+
+-- 图索引
+CREATE INDEX idx_links_source ON memory_links(source_id);
+CREATE INDEX idx_links_target ON memory_links(target_id);
+CREATE INDEX idx_links_type ON memory_links(link_type);
+2.1.3 待办表 (todos)
+CREATE TABLE todos (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title           TEXT NOT NULL,
+    description     TEXT,
+    
+    status          TODO_STATUS_ENUM DEFAULT 'pending',  -- pending, in_progress, completed, cancelled
+    priority        PRIORITY_ENUM DEFAULT 'medium',      -- low, medium, high, urgent
+    
+    due_date        DATE,
+    completed_at    TIMESTAMP,
+    
+    -- 关键: 与记忆的双向关联
+    source_memory_ids   UUID[],        -- 触发此待办的记忆ID
+    related_memory_ids  UUID[],        -- 相关的记忆ID (交叉验证用)
+    
+    project_id      UUID,              -- 关联项目
+    
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_todos_status ON todos(status);
+CREATE INDEX idx_todos_due ON todos(due_date);
+CREATE INDEX idx_todos_memory ON todos USING GIN(source_memory_ids);
+2.1.4 项目表 (projects)
+CREATE TABLE projects (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    description     TEXT,
+    code_repo       TEXT,               -- 代码仓库URL
+    status          PROJECT_STATUS DEFAULT 'active',
+    
+    -- 项目关联的记忆集合
+    memory_ids      UUID[],
+    todo_ids        UUID[],
+    lesson_ids      UUID[],             -- 关联的经验教训
+    
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+2.1.5 经验教训表 (lessons)
+CREATE TABLE lessons (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title           TEXT NOT NULL,
+    content         TEXT NOT NULL,      -- 简短描述 (建议 < 200字)
+    
+    category        VARCHAR(50),        -- tool_usage, deployment, bug_fix, workflow, decision
+    tags            TEXT[],
+    
+    -- 关键: 关联溯源
+    source_memory_ids   UUID[],        -- 来源记忆
+    source_todo_ids     UUID[],        -- 来源待办
+    source_project_ids  UUID[],        -- 来源项目
+    
+    -- 复用统计
+    reference_count    INT DEFAULT 0,  -- 被引用次数
+    last_referenced_at TIMESTAMP,
+    
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_lessons_category ON lessons(category);
+CREATE INDEX idx_lessons_tags ON lessons USING GIN(tags);
+2.1.6 文件元数据表 (file_metadata) ⚠️ 重点
+CREATE TABLE file_metadata (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- 基础信息
+    filename        TEXT NOT NULL,
+    original_path   TEXT,
+    stored_path     TEXT,               -- MinIO key
+    file_size       BIGINT,             -- 字节
+    mime_type       TEXT,
+    format          VARCHAR(20),        -- mp4, mkv, pdf, zip...
+    
+    -- 媒体属性 (音视频)
+    duration        FLOAT,              -- 秒
+    resolution      VARCHAR(20),        -- 1920x1080
+    bitrate         BIGINT,
+    codec           VARCHAR(50),
+    
+    -- 语义向量 (文件内容/帧)
+    embedding       vector(1536),       -- 视频关键帧 / 音频embedding
+    
+    -- 自动提取的元数据
+    auto_summary    TEXT,               -- LLM生成的摘要
+    transcript      TEXT,               -- 字幕/ transcript
+    user_description TEXT,              -- 用户原始描述 "三体电影"
+    user_tags       TEXT[],
+    
+    -- 地理空间元数据
+    location        GEOGRAPHY(POINT),   -- GPS坐标
+    location_name   TEXT,               -- 地名 "北京朝阳区"
+    
+    -- 指纹 (去重)
+    md5_hash        VARCHAR(32),
+    perceptual_hash VARCHAR(32),        -- 感知哈希 (近似重复检测)
+    
+    -- 关联
+    memory_ids      UUID[],             -- 关联的记忆
+    project_id      UUID,
+    
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_file_embedding ON file_metadata USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX idx_file_size ON file_metadata(file_size);
+CREATE INDEX idx_file_location ON file_metadata USING GIST(location);
+CREATE INDEX idx_file_tags ON file_metadata USING GIN(user_tags);
+CREATE INDEX idx_file_hash ON file_metadata(md5_hash);
+3.2 召回通道详解
+3.2.1 语义向量召回 (pgvector)
+-- 基础语义搜索
+SELECT id, content, 1 - (embedding <=> $query_embedding) as similarity
+FROM memory_atoms 
+WHERE atom_type IN ('raw_daily', 'refined_weekly', 'project_doc')
+ORDER BY embedding <=> $query_embedding
+LIMIT 50;
+
+-- 文件语义搜索 (针对 "三体电影")
+SELECT id, filename, auto_summary, file_size, resolution,
+       1 - (embedding <=> $query_embedding) as similarity
+FROM file_metadata
+WHERE file_size > 0
+ORDER BY embedding <=> $query_embedding
+LIMIT 30;
+
+-- 带时间权重的语义搜索
+SELECT id, content, source_date,
+       1 - (embedding <=> $query_embedding) as similarity,
+       CASE 
+           WHEN source_date >= CURRENT_DATE - INTERVAL '7 days' THEN 1.3
+           WHEN source_date >= CURRENT_DATE - INTERVAL '30 days' THEN 1.1
+           WHEN source_date >= CURRENT_DATE - INTERVAL '90 days' THEN 1.0
+           ELSE 0.8
+       END as time_weight
+FROM memory_atoms
+ORDER BY (similarity * time_weight) DESC
+LIMIT 50;
+3.2.2 关键词分词召回 (Elasticsearch + IK)
+{
+  "query": {
+    "bool": {
+      "should": [
+        { "match": { "content": { "query": "三体电影", "boost": 2.0 }}},
+        { "match": { "filename": { "query": "三体", "boost": 1.5 }}},
+        { "match": { "tags": { "query": "三体", "boost": 1.5 }}},
+        { "match_phrase": { "user_description": "三体" }},
+        { "match_phrase_prefix": { "filename": "三体" }}
+      ],
+      "filter": [
+        { "range": { "file_size": { "gte": 7000000000 }}}
+      ],
+      "minimum_should_match": 1
+    }
+  },
+  "highlight": {
+    "fields": {
+      "content": {},
+      "filename": {}
+    }
+  }
+}
+3.2.3 关系图谱召回 (Neo4j)
+// 路径: 记忆 -> 待办 -> 项目 -> 相关记忆
+MATCH (m:Memory {content: '三体'})
+OPTIONAL MATCH (m)-[:RELATED]->(m2:Memory)
+OPTIONAL MATCH (m)-[:TRIGGERED]->(t:Todo)
+OPTIONAL MATCH (t)-[:BELONGS_TO]->(p:Project)
+OPTIONAL MATCH (p)-[:HAS]->(m3:Memory)
+RETURN m, m2, t, p, m3
+LIMIT 30
+
+// 查找与"三体"相关的所有实体 (记忆 + 文件 + 经验)
+MATCH (n)-[r]-(m:Memory)
+WHERE m.content CONTAINS '三体' OR m.tags CONTAINS '三体'
+RETURN n, r, labels(n) as entity_type
+LIMIT 50
+
+// 扩展关联: 找到相关文件的记忆
+MATCH (f:File)-[:LINKED]-(m:Memory)
+WHERE m.content CONTAINS '三体'
+RETURN f, m
+ORDER BY f.file_size DESC
+3.2.4 元数据精确过滤
+-- 条件组合查询
+SELECT 
+    id, filename, file_size, mime_type, format,
+    resolution, duration, user_description, user_tags,
+    ST_X(location::geometry) as lon, 
+    ST_Y(location::geometry) as lat,
+    created_at
+FROM file_metadata 
+WHERE 
+    -- 大小范围 (8GB左右，允许±20%误差)
+    (file_size BETWEEN 7000000000 AND 9000000000 OR file_size IS NULL)
+    -- 格式匹配
+    AND (format IN ('mp4', 'mkv', 'avi', 'mov') OR mime_type LIKE 'video/%')
+    -- 用户描述/标签命中
+    AND (
+        user_description ILIKE '%三体%' 
+        OR filename ILIKE '%三体%' 
+        OR user_tags && ARRAY['三体', '电影']
+    )
+    -- 地理位置过滤 (可选)
+    AND (location IS NULL OR ST_DWithin(location, ST_MakePoint(116.4, 39.9)::geography, 50000))
+ORDER BY file_size DESC, created_at DESC
+LIMIT 20;
+3.3 融合排序算法
+3.3.1 融合公式
+# 融合公式
+def fusion_rank(results_list, query_context):
+    """
+    results_list: [[result_a, result_b, ...], ...]  # 多路召回结果
+    query_context: {
+        session_memory_ids,  # 当前会话相关记忆
+        active_project,       # 活跃项目
+        time_range,          # 时间范围
+        user_preferences     # 用户偏好
+    }
+    """
+    
+    # ============ Step 1: 去重合并 ============
+    merged = {}
+    for channel_results in results_list:
+        for item in channel_results:
+            if item.id not in merged:
+                merged[item.id] = {
+                    'item': item,
+                    'scores': {},
+                    'channels': [],
+                    'metadata_hits': 0
+                }
+            merged[item.id]['scores'][item.channel] = item.score
+            merged[item.id]['channels'].append(item.channel)
+            
+            # 统计元数据命中
+            if item.metadata_matches:
+                merged[item.id]['metadata_hits'] += len(item.metadata_matches)
+    
+    # ============ Step 2: 权重融合 ============
+    channel_weights = {
+        'semantic': 0.35,    # 语义向量
+        'keyword': 0.30,     # 关键词
+        'graph': 0.20,       # 关系图谱
+        'metadata': 0.15     # 元数据精确匹配
+    }
+    
+    final_results = []
+    for id, data in merged.items():
+        item = data['item']
+        
+        # 基础融合分数
+        fused_score = 0
+        for ch, weight in channel_weights.items():
+            score = data['scores'].get(ch, 0)
+            fused_score += score * weight
+        
+        # ============ Step 3: 上下文增强 ============
+        
+        # 3.1 当前会话相关加权
+        if item.id in query_context.session_memory_ids:
+            fused_score *= 1.3
+        
+        # 3.2 活跃项目关联加权
+        if item.project_id == query_context.active_project:
+            fused_score *= 1.25
+        
+        # 3.3 多通道命中加权
+        channel_count = len(data['channels'])
+        if channel_count >= 3:
+            fused_score *= 1.2
+        elif channel_count == 2:
+            fused_score *= 1.1
+        
+        # 3.4 元数据命中加权
+        if data['metadata_hits'] > 0:
+            fused_score *= (1 + 0.1 * min(data['metadata_hits'], 3))
+        
+        # ============ Step 4: 时间衰减 ============
+        days_old = (now - item.created_at).days
+        if days_old <= 7:
+            time_factor = 1.2
+        elif days_old <= 30:
+            time_factor = 1.1
+        elif days_old <= 90:
+            time_factor = 1.0
+        elif days_old <= 365:
+            time_factor = max(0.7, 1 - (days_old - 90) / 500)
+        else:
+            time_factor = 0.5
+        
+        fused_score *= time_factor
+        
+        # ============ Step 5: 用户偏好调整 ============
+        if query_context.user_preferences:
+            # 例如用户偏好视频，文件类型加权
+            if item.type == 'file' and item.format in query_context.user_preferences.get('preferred_formats', []):
+                fused_score *= 1.15
+        
+        item.final_score = fused_score
+        item.channels_hit = data['channels']
+        final_results.append(item)
+    
+    # ============ Step 6: 排序返回 ============
+    return sorted(final_results, key=lambda x: x.final_score, reverse=True)
+3.3.2 融合流程图
+┌─────────────────────────────────────────────────────────────────────┐
+│                     多路召回结果输入                                 │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │ 语义: 50  │  │ 关键词: 50│  │ 图谱: 30  │  │ 元数据: 20│       │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘       │
+└────────┼──────────────┼──────────────┼──────────────┼─────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         去重合并                                     │
+│  ID=uuid1: 语义0.9 + 关键词0.8 = 多通道命中                         │
+│  ID=uuid2: 语义0.7 + 元数据命中 = 多维度命中                        │
+│  ID=uuid3: 仅关键词0.6                                              │
+└─────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       权重融合 + 上下文增强                          │
+│                                                                      │
+│  score = Σ(channel_score × weight) × context_factor × time_factor  │
+│                                                                      │
+│  上下文因子:                                                         │
+│    - 当前会话相关 ×1.3                                              │
+│    - 活跃项目关联 ×1.25                                            │
+│    - 多通道命中(≥3) ×1.2                                           │
+│    - 元数据命中 ×(1+0.1n)                                          │
+│                                                                      │
+│  时间因子: 7天内×1.2, 30天内×1.1, 1年内不衰减, 1年后最低0.5        │
+└─────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         最终排序结果                                 │
+│  1. [文件] 三体.mp4 (8.2GB, 1920x1080) - score: 0.92               │
+│  2. [记忆] 用户保存了三体电影 - score: 0.85                         │
+│  3. [记忆] 关于三体项目的讨论 - score: 0.78                         │
+│  4. [文件] 三体第二部.mkv (6.5GB) - score: 0.71                     │
+│  5. [经验] 视频文件存储经验 - score: 0.65                           │
+└─────────────────────────────────────────────────────────────────────┘
+
+4. 元数据自动提取设计
+4.1 元数据提取管道架构
+┌─────────────────────────────────────────────────────────────────────┐
+│                     用户输入 (自然语言描述)                          │
+│  "帮我存一下这个8GB的《三体》MP4电影，在北京朝阳拍的"               │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 1: 基础元数据提取                          │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ 1. 文件名提取: "三体.MP4"                                        ││
+│  │    - 标题: 三体                                                 ││
+│  │    - 格式: mp4                                                  ││
+│  │    - 类型: video/mp4                                           ││
+│  ├─────────────────────────────────────────────────────────────────┤│
+│  │ 2. 大小提取: "8GB"                                              ││
+│  │    - 转换为字节: 8589934592                                     ││
+│  │    - 区间标记: large (>1GB)                                     ││
+│  ├─────────────────────────────────────────────────────────────────┤│
+│  │ 3. 时间提取: "拍的" → 当前时间                                   ││
+│  │    - created_at: 2026-03-19                                    ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 2: 语义元数据提取 (LLM)                    │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ 输入: "帮我存一下这个8GB的《三体》MP4电影，在北京朝阳拍的"      ││
+│  │                                                                     ││
+│  │ LLM 提取结果:                                                    ││
+│  │ {                                                               ││
+│  │   "title": "三体",                                              ││
+│  │   "category": "电影/视频",                                      ││
+│  │   "tags": ["三体", "电影", "科幻"],                             ││
+│  │   "location_name": "北京朝阳区",                                ││
+│  │   "description": "三体系列电影第一部",                          ││
+│  │   "sentiment": "正面",                                          ││
+│  │   "implied_intent": "收藏/观看",                                ││
+│  │   "related_entities": ["刘慈欣", "小说三体"]                   ││
+│  │ }                                                               ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 3: 媒体特征提取 (可选)                     │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ ffprobe 提取:                                                   ││
+│  │ {                                                               ││
+│  │   "duration": 8760.5,      # 2小时26分                         ││
+│  │   "resolution": "1920x1080",                                   ││
+│  │   "bitrate": 8000000,      # 8Mbps                             ││
+│  │   "codec": "h264",         # H.264 编码                        ││
+│  │   "audio_codec": "aac",    # AAC 音频                          ││
+│  │   "file_size": 8589934592  # 8GB                               ││
+│  │ }                                                               ││
+│  ├─────────────────────────────────────────────────────────────────┤│
+│  │ 关键帧提取 (每5分钟):                                           ││
+│  │   frame_1.png → embedding_1 (Qwen-VL)                         ││
+│  │   frame_2.png → embedding_2                                     ││
+│  │   ...                                                           ││
+│  ├─────────────────────────────────────────────────────────────────┤│
+│  │ 音频指纹:                                                       ││
+│  │   audio_embedding ( Whisper + embedding)                       ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 4: 地理编码 (可选)                         │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ 输入: location_name = "北京朝阳区"                              ││
+│  │                                                                     ││
+│  │ 高德/百度 Geocoding API:                                        ││
+│  │ {                                                               ││
+│  │   "lat": 39.9042,                                               ││
+│  │   "lon": 116.4074,                                              ││
+│  │   "province": "北京市",                                         ││
+│  │   "city": "北京市",                                             ││
+│  │   "district": "朝阳区",                                         ││
+│  │   "adcode": "110105"                                            ││
+│  │ }                                                               ││
+│  │                                                                     ││
+│  │ 存储: ST_SetSRID(ST_MakePoint(116.4074, 39.9042), 4326)        ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 5: 向量生成                                │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ 文本内容向量:                                                   ││
+│  │   embedding = text_embedding("三体电影, 用户描述, 标签...")   ││
+│  │                                                                     ││
+│  │ 媒体文件向量:                                                   ││
+│  │   - 视频: 提取关键帧 → Qwen-VL → 向量                           ││
+│  │   - 音频: Whisper转写 + audio-embedding                        ││
+│  │   - 图片: Qwen-VL 直接向量                                      ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phase 6: 自动建立关联                            │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ 1. 创建记忆: "用户保存了三体电影, 8GB"                         ││
+│  │ 2. 关联文件与记忆: link_type = 'linked_file'                   ││
+│  │ 3. 提取标签: ["三体", "电影", "视频", "科幻"]                  ││
+│  │ 4. 存入向量库: file_embedding → pgvector                       ││
+│  │ 5. 索引到ES: filename, user_description, tags                  ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+4.2 元数据提取实现方式
+元数据类型	提取方式	实现技术
+文件名	正则解析	re.match(r'(.+)\.(\w+)$', filename)
+文件大小	数值解析	int(8GB) → 8589934592
+文件格式	扩展名	pathlib.Path.suffix → .mp4 → video/mp4
+媒体属性	ffprobe	ffprobe -v quiet -print_format json -show_streams
+媒体时长	ffprobe	format.duration
+分辨率	ffprobe	streams[0].width × streams[0].height
+码率	ffprobe	streams[0].bit_rate
+视频编码	ffprobe	streams[0].codec_name
+音频编码	ffprobe	streams[codec_type=audio].codec_name
+地理位置	地名→坐标	高德/百度 Geocoding API
+用户描述	NLP 实体识别	LLM: 提取实体、情感、意图
+自动标签	关键词+分类	LLM + 关键词库
+内容摘要	LLM 生成	summary = llm.summarize(file_content)
+视频向量	多模态模型	Qwen-VL 提取关键帧向量
+音频向量	Whisper + embedding	音频转写 + 声纹向量
+感知哈希	视频指纹	pHash / aHash (近似重复检测)
+MD5 哈希	文件完整性	hashlib.md5(file.read())
+4.3 数值与单位解析
+# 数值解析规则
+
+SIZE_PATTERNS = {
+    r'(\d+(?:\.\d+)?)\s*TB': lambda x: x * 1024**4,
+    r'(\d+(?:\.\d+)?)\s*GB': lambda x: x * 1024**3,
+    r'(\d+(?:\.\d+)?)\s*MB': lambda x: x * 1024**2,
+    r'(\d+(?:\.\d+)?)\s*KB': lambda x: x * 1024,
+    r'(\d+(?:\.\d+)?)\s*B': lambda x: x,
+}
+
+DURATION_PATTERNS = {
+    r'(\d+)\s*小时': lambda h: h * 3600,
+    r'(\d+)\s*h': lambda h: h * 3600,
+    r'(\d+)\s*分钟': lambda m: m * 60,
+    r'(\d+)\s*min': lambda m: m * 60,
+    r'(\d+)\s*秒': lambda s: s,
+    r'(\d+)\s*s': lambda s: s,
+    r'(\d+):(\d+):(\d+)': lambda h, m, s: h*3600 + m*60 + s,  # HH:MM:SS
+    r'(\d+):(\d+)': lambda m, s: m*60 + s,  # MM:SS
+}
+
+# 解析函数
+def parse_file_size(text: str) -> Optional[int]:
+    """解析文件大小描述"""
+    for pattern, converter in SIZE_PATTERNS.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = float(match.group(1))
+            return int(converter(value))
+    return None
+
+def parse_duration(text: str) -> Optional[float]:
+    """解析时长描述"""
+    for pattern, converter in DURATION_PATTERNS.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            args = [float(g) for g in match.groups()]
+            return converter(*args)
+    return None
+
+# 使用示例
+parse_file_size("8GB")        # → 8589934592
+parse_file_size("10.5MB")     # → 11010048
+parse_duration("2小时26分")   # → 8760.0
+parse_duration("1:30:45")     # → 5445.0
+
+
+4.4 地理位置处理 (完整代码)
+class GeocodingService:
+    """地理编码服务 - 地名转坐标"""
+    
+    def __init__(self, api_key: str, provider: str = "amap"):
+        self.api_key = api_key
+        self.provider = provider  # amap/baidu
+    
+    async def geocode(self, location_name: str) -> Optional[dict]:
+        """地名转坐标"""
+        
+        if not location_name:
+            return None
+        
+        if self.provider == "amap":
+            return await self._amap_geocode(location_name)
+        elif self.provider == "baidu":
+            return await self._baidu_geocode(location_name)
+        else:
+            raise ValueError(f"Unknown provider: {self.provider}")
+    
+    async def _amap_geocode(self, location_name: str) -> Optional[dict]:
+        """高德地图地理编码"""
+        
+        url = "https://restapi.amap.com/v3/geocode/geo"
+        params = {
+            "key": self.api_key,
+            "address": location_name,
+            "output": "JSON"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                
+                if data.get("status") == "1" and data.get("geocodes"):
+                    geo = data["geocodes"][0]
+                    location = geo["location"].split(",")
+                    
+                    return {
+                        "lon": float(location[0]),
+                        "lat": float(location[1]),
+                        "province": geo.get("province", ""),
+                        "city": geo.get("city", ""),
+                        "district": geo.get("district", ""),
+                        "adcode": geo.get("adcode", ""),
+                        "formatted_address": geo.get("formatted_address", "")
+                    }
+        
+        return None
+    
+    async def _baidu_geocode(self, location_name: str) -> Optional[dict]:
+        """百度地图地理编码"""
+        
+        url = "http://api.map.baidu.com/geocoding/v3/"
+        params = {
+            "address": location_name,
+            "output": "json",
+            "ak": self.api_key
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                
+                if data.get("status") == 0:
+                    loc = data["result"]["location"]
+                    comp = data["result"]["addressComponent"]
+                    
+                    return {
+                        "lon": loc["lng"],
+                        "lat": loc["lat"],
+                        "province": comp.get("province", ""),
+                        "city": comp.get("city", ""),
+                        "district": comp.get("district", ""),
+                        "adcode": comp.get("adcode", ""),
+                        "formatted_address": data["result"].get("formatted_address", "")
+                    }
+        
+        return None
+    
+    def to_postgis(self, lat: float, lon: float) -> str:
+        """转换为 PostGIS geography 类型的 WKT"""
+        return f"ST_SetSRID(ST_MakePoint({lon}, {lat}), 4326)::geography"
+    
+    def to_geojson(self, lat: float, lon: float) -> dict:
+        """转换为 GeoJSON Point"""
+        return {
+            "type": "Point",
+            "coordinates": [lon, lat]
+        }
+
+
+class ReverseGeocodingService:
+    """逆地理编码 - 坐标转地名"""
+    
+    def __init__(self, api_key: str, provider: str = "amap"):
+        self.api_key = api_key
+        self.provider = provider
+    
+    async def reverse(self, lat: float, lon: float) -> Optional[dict]:
+        """坐标转地名"""
+        
+        if self.provider == "amap":
+            return await self._amap_reverse(lat, lon)
+        elif self.provider == "baidu":
+            return await self._baidu_reverse(lat, lon)
+        
+        return None
+    
+    async def _amap_reverse(self, lat: float, lon: float) -> Optional[dict]:
+        """高德逆地理编码"""
+        
+        url = "https://restapi.amap.com/v3/geocode/regeo"
+        params = {
+            "key": self.api_key,
+            "location": f"{lon},{lat}",  # 高德: 经度,纬度
+            "output": "JSON",
+            "radius": "1000"  # 半径(米)
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                
+                if data.get("status") == "1":
+                    regeo = data.get("regeocode", {})
+                    address = regeo.get("addressComponent", {})
+                    
+                    return {
+                        "formatted_address": regeo.get("formatted_address", ""),
+                        "province": address.get("province", ""),
+                        "city": address.get("city", ""),
+                        "district": address.get("district", ""),
+                        "township": address.get("township", ""),
+                        "street": address.get("streetNumber", {}).get("street", ""),
+                        "number": address.get("streetNumber", {}).get("number", "")
+                    }
+        
+        return None
+
+
+# 地理位置查询示例
+async def query_location_examples():
+    """地理位置查询示例"""
+    
+    geocoder = GeocodingService(api_key="your_api_key")
+    reverse = ReverseGeocodingService(api_key="your_api_key")
+    
+    # 1. 地名 → 坐标
+    result = await geocoder.geocode("北京朝阳区")
+    print(result)
+    # 输出: {'lon': 116.4074, 'lat': 39.9042, 'province': '北京市', 'city': '北京市', 'district': '朝阳区'}
+    
+    # 2. 坐标 → 地名
+    name = await reverse.reverse(39.9042, 116.4074)
+    print(name)
+    # 输出: {'formatted_address': '北京市朝阳区...', 'province': '北京市', 'city': '北京市', 'district': '朝阳区'}
+    
+    # 3. 转换为 PostGIS
+    postgis_wkt = geocoder.to_postgis(39.9042, 116.4074)
+    print(postgis_wkt)
+    # 输出: ST_SetSRID(ST_MakePoint(116.4074, 39.9042), 4326)::geography
+
+
+4.5 媒体特征提取 (完整版)
+import subprocess
+import json
+import os
+import tempfile
+from typing import List, Optional, Dict
+from PIL import Image
+
+
+class MediaFeatureExtractor:
+    """媒体特征提取器 - 视频/音频/图片"""
+    
+    def __init__(self, ffprobe_path: str = "ffprobe", ffmpeg_path: str = "ffmpeg"):
+        self.ffprobe_cmd = ffprobe_path
+        self.ffmpeg_cmd = ffmpeg_path
+    
+    def extract(self, file_path: str) -> Dict:
+        """提取媒体特征"""
+        
+        media_type = self._detect_media_type(file_path)
+        
+        if media_type == "video":
+            return self._extract_video_features(file_path)
+        elif media_type == "audio":
+            return self._extract_audio_features(file_path)
+        elif media_type == "image":
+            return self._extract_image_features(file_path)
+        else:
+            return {}
+    
+    def _detect_media_type(self, file_path: str) -> str:
+        """检测媒体类型"""
+        
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        video_exts = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v']
+        audio_exts = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']
+        image_exts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff']
+        
+        if ext in video_exts:
+            return "video"
+        elif ext in audio_exts:
+            return "audio"
+        elif ext in image_exts:
+            return "image"
+        
+        return "unknown"
+    
+    def _extract_video_features(self, file_path: str) -> Dict:
+        """提取视频特征"""
+        
+        cmd = [
+            self.ffprobe_cmd, "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", "-i", file_path
+        ]
+        
+        try:
+            result = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+            data = json.loads(result)
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return {}
+        
+        features = {}
+        
+        # 视频流信息
+        video_stream = next((
+            s for s in data.get('streams', []) 
+            if s.get('codec_type') == 'video'
+        ), None)
+        
+        if video_stream:
+            fps_str = video_stream.get('r_frame_rate', '0/1')
+            fps = eval(fps_str) if '/' in fps_str else float(fps_str)
+            
+            features.update({
+                'width': video_stream.get('width', 0),
+                'height': video_stream.get('height', 0),
+                'resolution': f"{video_stream.get('width', 0)}x{video_stream.get('height', 0)}",
+                'codec': video_stream.get('codec_name'),
+                'fps': round(fps, 2),
+                'bitrate': int(video_stream.get('bit_rate', 0)),
+                'pix_fmt': video_stream.get('pix_fmt')
+            })
+        
+        # 音频流信息
+        audio_stream = next((
+            s for s in data.get('streams', []) 
+            if s.get('codec_type') == 'audio'
+        ), None)
+        
+        if audio_stream:
+            features.update({
+                'audio_codec': audio_stream.get('codec_name'),
+                'audio_bitrate': int(audio_stream.get('bit_rate', 0)),
+                'sample_rate': int(audio_stream.get('sample_rate', 0)),
+                'channels': audio_stream.get('channels')
+            })
+        
+        # 格式信息
+        format_info = data.get('format', {})
+        features.update({
+            'duration': float(format_info.get('duration', 0)),
+            'duration_display': self._format_duration(float(format_info.get('duration', 0))),
+            'file_size': int(format_info.get('size', 0)),
+            'file_size_display': self._format_size(int(format_info.get('size', 0))),
+            'format_name': format_info.get('format_name'),
+            'bit_rate': int(format_info.get('bit_rate', 0))
+        })
+        
+        features['quality_label'] = self._estimate_quality_label(
+            features.get('width', 0), features.get('height', 0), features.get('bit_rate', 0)
+        )
+        
+        return features
+    
+    def _extract_audio_features(self, file_path: str) -> Dict:
+        """提取音频特征"""
+        
+        cmd = [self.ffprobe_cmd, "-v", "quiet", "-print_format", "json",
+               "-show_format", "-show_streams", "-i", file_path]
+        
+        try:
+            result = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+            data = json.loads(result)
+        except:
+            return {}
+        
+        features = {}
+        
+        audio_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'audio'), None)
+        
+        if audio_stream:
+            features.update({
+                'codec': audio_stream.get('codec_name'),
+                'sample_rate': int(audio_stream.get('sample_rate', 0)),
+                'channels': audio_stream.get('channels'),
+                'bitrate': int(audio_stream.get('bit_rate', 0))
+            })
+        
+        format_info = data.get('format', {})
+        features.update({
+            'duration': float(format_info.get('duration', 0)),
+            'duration_display': self._format_duration(float(format_info.get('duration', 0))),
+            'file_size': int(format_info.get('size', 0)),
+            'file_size_display': self._format_size(int(format_info.get('size', 0))),
+            'format': format_info.get('format_name')
+        })
+        
+        return features
+    
+    def _extract_image_features(self, file_path: str) -> Dict:
+        """提取图片特征"""
+        
+        features = {}
+        
+        try:
+            with Image.open(file_path) as img:
+                features.update({
+                    'width': img.width,
+                    'height': img.height,
+                    'resolution': f"{img.width}x{img.height}",
+                    'format': img.format,
+                    'mode': img.mode,
+                    'file_size': os.path.getsize(file_path),
+                    'file_size_display': self._format_size(os.path.getsize(file_path))
+                })
+                
+                if img.mode == 'RGBA':
+                    features['color_type'] = 'RGBA (带透明)'
+                elif img.mode == 'L':
+                    features['color_type'] = '灰度'
+                else:
+                    features['color_type'] = 'RGB'
+        except:
+            pass
+        
+        return features
+    
+    def extract_keyframes(self, file_path: str, interval: int = 300, max_frames: int = 10) -> List[str]:
+        """提取关键帧 (用于向量生成)"""
+        
+        features = self._extract_video_features(file_path)
+        duration = features.get('duration', 0)
+        
+        if duration == 0:
+            return []
+        
+        num_frames = min(max_frames, max(1, int(duration / interval)))
+        interval = duration / num_frames
+        
+        keyframes = []
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(num_frames):
+                t = interval * i
+                output_path = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
+                
+                cmd = [self.ffmpeg_cmd, "-ss", str(t), "-i", file_path,
+                       "-vframes", "1", "-q:v", "2", "-y", output_path]
+                
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        keyframes.append(output_path)
+                except:
+                    continue
+        
+        return keyframes
+    
+    def _format_duration(self, seconds: float) -> str:
+        """格式化时长"""
+        
+        if seconds < 60:
+            return f"{int(seconds)}秒"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)}分{int(seconds % 60)}秒"
+        else:
+            return f"{int(seconds // 3600)}小时{int((seconds % 3600) // 60)}分"
+    
+    def _format_size(self, bytes_size: int) -> str:
+        """格式化文件大小"""
+        
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_size < 1024:
+                return f"{bytes_size:.2f} {unit}"
+            bytes_size /= 1024
+        return f"{bytes_size:.2f} PB"
+    
+    def _estimate_quality_label(self, width: int, height: int, bitrate: int) -> str:
+        """估算视频质量标签"""
+        
+        pixels = width * height
+        
+        if pixels >= 8294400:
+            return "4K"
+        elif pixels >= 2073600:
+            return "1080P" if bitrate > 3000000 else "1080P 标准"
+        elif pixels >= 921600:
+            return "720P"
+        elif pixels >= 480000:
+            return "标清"
+        else:
+            return "低清"
+
+
+4.6 LLM 元数据提取
+import json
+import re
+import os
+from typing import Dict, List, Optional
+
+
+class LLMMetadataExtractor:
+    """基于 LLM 的语义元数据提取"""
+    
+    SYSTEM_PROMPT = """你是一个专业的元数据提取助手。
+根据用户描述的信息，提取结构化的元数据。
+
+请严格按照JSON格式返回，不要有其他内容。
+可用字段:
+- title: 标题/名称 (string)
+- category: 分类 (可选: movie/video/document/image/audio/code/other)
+- tags: 关键词标签数组
+- location_name: 地名,如果有
+- description: 简短描述,不超过50字
+- related_entities: 相关的实体,如人名、作品名等
+- implied_intent: 隐含意图 (store/watch/use/share/review)
+
+如果某字段无法提取,请使用null。"""
+    
+    def __init__(self, llm_client):
+        self.llm = llm_client
+    
+    async def extract(self, user_description: str, filename: str = None) -> Dict:
+        """提取语义元数据"""
+        
+        input_text = user_description
+        if filename:
+            input_text += f"\n\n文件名: {filename}"
+        
+        try:
+            response = await self.llm.chat(system=self.SYSTEM_PROMPT, user=input_text)
+            metadata = self._parse_json_response(response)
+        except:
+            metadata = {}
+        
+        # 从文件名补充信息
+        if filename and not metadata.get('title'):
+            metadata['title'] = os.path.splitext(filename)[0]
+        
+        if filename and not metadata.get('category'):
+            metadata['category'] = self._infer_category_from_filename(filename)
+        
+        return metadata
+    
+    def _parse_json_response(self, response: str) -> Dict:
+        """解析 LLM 返回的 JSON"""
+        
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except:
+                    pass
+        return {}
+    
+    def _infer_category_from_filename(self, filename: str) -> Optional[str]:
+        """从文件名推断分类"""
+        
+        ext = os.path.splitext(filename)[1].lower()
+        
+        video_exts = ['.mp4', '.mkv', '.avi', '.mov']
+        audio_exts = ['.mp3', '.wav', '.flac', '.aac']
+        image_exts = ['.jpg', '.jpeg', '.png', '.gif']
+        doc_exts = ['.pdf', '.doc', '.docx', '.txt']
+        
+        if ext in video_exts:
+            return 'video'
+        elif ext in audio_exts:
+            return 'audio'
+        elif ext in image_exts:
+            return 'image'
+        elif ext in doc_exts:
+            return 'document'
+        
+        return None
+    
+    async def generate_summary(self, content: str, max_length: int = 200) -> str:
+        """生成内容摘要"""
+        
+        prompt = f"请为以下内容生成一个{max_length}字以内的简洁摘要:\n\n{content[:5000]}\n\n摘要:"
+        
+        return await self.llm.chat(prompt=prompt)
+    
+    async def extract_tags_from_content(self, content: str) -> List[str]:
+        """从内容中提取标签"""
+        
+        prompt = f"从以下内容中提取关键词标签 (5-10个):\n\n{content[:3000]}\n\n返回JSON数组:"
+        
+        try:
+            response = await self.llm.chat(prompt=prompt)
+            tags = json.loads(response)
+            if isinstance(tags, list):
+                return [str(t) for t in tags]
+        except:
+            pass
+        
+        return []
+4.7 完整提取流程
+import os
+import hashlib
+from typing import Dict, Optional
+from datetime import datetime
+
+
+class MetadataPipeline:
+    """完整元数据提取管道"""
+    
+    def __init__(self, llm_client, geocoding_client, embedding_service, 
+                 media_extractor, minio_client, db_client, kafka_producer):
+        self.llm = llm_client
+        self.geo = geocoding_client
+        self.embedding = embedding_service
+        self.media = media_extractor
+        self.minio = minio_client
+        self.db = db_client
+        self.kafka = kafka_producer
+    
+    async def process(self, file_path: str, user_description: str = "",
+                      user_tags: list = None, project_id: str = None) -> Dict:
+        """完整处理流程"""
+        
+        metadata = {}
+        
+        # Phase 1: 基础元数据
+        basic = self._extract_basic(file_path)
+        metadata.update(basic)
+        
+        # Phase 2: 语义提取 (LLM)
+        semantic = await self._extract_semantic(user_description, metadata.get('filename'))
+        metadata.update(semantic)
+        
+        if user_tags:
+            metadata['user_tags'] = list(set(metadata.get('user_tags', []) + user_tags))
+        
+        # Phase 3: 媒体特征
+        if self._is_media(file_path):
+            media_features = self.media.extract(file_path)
+            if media_features.get('file_size'):
+                metadata['file_size'] = media_features['file_size']
+            if media_features.get('duration'):
+                metadata['duration'] = media_features['duration']
+            metadata['media_features'] = media_features
+        
+        # Phase 4: 地理编码
+        if metadata.get('location_name'):
+            geo_result = await self.geo.geocode(metadata['location_name'])
+            if geo_result:
+                metadata.update({
+                    'location': self.geo.to_postgis(geo_result['lat'], geo_result['lon']),
+                    'location_lat': geo_result['lat'],
+                    'location_lon': geo_result['lon']
+                })
+        
+        # Phase 5: 哈希计算
+        metadata['md5_hash'] = self._calculate_md5(file_path)
+        
+        # Phase 6: 向量生成
+        text_for_embedding = f"{metadata.get('title', '')} {metadata.get('description', '')} {' '.join(metadata.get('user_tags', []))}"
+        metadata['embedding'] = await self.embedding.encode(text_for_embedding)
+        
+        # Phase 7: 存储到 MinIO
+        stored_path = await self._store_to_minio(file_path, metadata)
+        metadata['stored_path'] = stored_path
+        
+        # Phase 8: 创建关联记忆
+        memory_id = await self._create_memory(metadata, user_description)
+        metadata['memory_id'] = memory_id
+        
+        # Phase 9: 写入数据库
+        file_id = await self._save_to_db(metadata, project_id)
+        metadata['id'] = file_id
+        
+        # Phase 10: 发送 Kafka 事件
+        await self._publish_event('created', metadata)
+        
+        return metadata
+    
+    def _extract_basic(self, path: str) -> Dict:
+        """基础元数据"""
+        
+        stat = os.stat(path)
+        filename = os.path.basename(path)
+        name, ext = os.path.splitext(filename)
+        
+        return {
+            'filename': filename,
+            'file_size': stat.st_size,
+            'format': ext[1:].lower() if ext else None,
+            'mime_type': self._get_mime_type(ext),
+            'title': name,
+            'created_at': datetime.now()
+        }
+    
+    async def _extract_semantic(self, user_description: str, filename: str = None) -> Dict:
+        """语义提取"""
+        
+        try:
+            return await self.llm.extract(user_description or '', filename)
+        except:
+            return {'title': filename or 'Untitled', 'category': 'other', 'user_tags': []}
+    
+    def _is_media(self, path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower()
+        return ext in ['.mp4', '.mkv', '.avi', '.mp3', '.wav', '.jpg', '.jpeg', '.png']
+    
+    def _calculate_md5(self, path: str) -> str:
+        hash_md5 = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    async def _store_to_minio(self, file_path: str, metadata: Dict) -> str:
+        bucket = "files"
+        object_key = f"{datetime.now().strftime('%Y%m%d')}/{metadata['filename']}"
+        
+        await self.minio.ensure_bucket(bucket)
+        await self.minio.upload_file(bucket, object_key, file_path)
+        
+        return f"minio://{bucket}/{object_key}"
+    
+    async def _create_memory(self, metadata: Dict, user_description: str) -> Optional[str]:
+        content = f"保存了文件: {metadata['filename']}"
+        if metadata.get('file_size'):
+            content += f", 大小: {metadata['file_size']} 字节"
+        
+        memory_data = {
+            'atom_type': 'raw_daily',
+            'content': content,
+            'tags': metadata.get('user_tags', []),
+            'source_date': datetime.now().date()
+        }
+        
+        return await self.db.create_memory(memory_data)
+    
+    async def _save_to_db(self, metadata: Dict, project_id: str) -> str:
+        file_data = {
+            'filename': metadata['filename'],
+            'file_size': metadata['file_size'],
+            'format': metadata['format'],
+            'title': metadata.get('title'),
+            'user_tags': metadata.get('user_tags', []),
+            'embedding': metadata.get('embedding'),
+            'stored_path': metadata.get('stored_path'),
+            'md5_hash': metadata.get('md5_hash'),
+            'project_id': project_id,
+            'memory_id': metadata.get('memory_id')
+        }
+        
+        return await self.db.create_file(file_data)
+    
+    async def _publish_event(self, event_type: str, metadata: Dict):
+        event = {
+            'event_type': event_type,
+            'file_id': metadata.get('id'),
+            'filename': metadata.get('filename'),
+            'payload': metadata
+        }
+        
+        await self.kafka.send('file_events', key=metadata.get('id'), value=event)
+    
+    def _get_mime_type(self, ext: str) -> str:
+        mime_types = {
+            '.mp4': 'video/mp4', '.mkv': 'video/x-matroska',
+            '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+            '.pdf': 'application/pdf',
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png'
+        }
+        return mime_types.get(ext.lower(), 'application/octet-stream')
+5. 记忆关联与交叉验证机制
+5.1 关联类型设计
+关联类型	方向	说明	示例
+derived	单向→	提炼记忆指向原始记忆	周总结 → 7个每日记忆
+part_of	双向	大记忆包含小记忆	项目文档 → 代码记录
+related	双向	语义相关联	两个项目的相似问题
+triggered	单向→	记忆触发待办	部署报错 → 修复待办
+verified	双向	待办验证了记忆	待办完成 → 确认判断
+references	单向→	引用关系	经验教训 → 源记忆
+linked_file	双向	记忆关联文件	文件上传 → 记忆
+5.2 关联表结构
+CREATE TYPE link_type AS ENUM (
+    'derived', 'part_of', 'related', 'triggered', 
+    'verified', 'references', 'linked_file'
+);
+
+CREATE TABLE memory_links (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id       UUID NOT NULL,
+    source_type     VARCHAR(30) NOT NULL,  -- memory/todo/lesson/file
+    target_id       UUID NOT NULL,
+    target_type     VARCHAR(30) NOT NULL,
+    link_type       link_type NOT NULL,
+    strength        FLOAT DEFAULT 0.5,
+    context         TEXT,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE(source_id, source_type, target_id, target_type, link_type)
+);
+
+CREATE INDEX idx_links_source ON memory_links(source_id, source_type);
+CREATE INDEX idx_links_target ON memory_links(target_id, target_type);
+好的，继续输出完整内容：
+
+---
+
+## 5.3 交叉验证流程 (完整代码)
+
+```python
+from typing import Dict, List, Optional
+from datetime import datetime
+
+
+class CrossValidator:
+    """交叉验证器 - 验证记忆状态"""
+    
+    def __init__(self, db_client):
+        self.db = db_client
+    
+    async def verify_memory(self, memory_id: str) -> Dict:
+        """验证记忆状态
+        
+        流程:
+        1. 获取记忆内容
+        2. 查找关联的待办 (triggered)
+        3. 查找验证关系 (verified)
+        4. 判断验证状态
+        """
+        
+        # 1. 获取记忆
+        memory = await self.db.get_memory(memory_id)
+        if not memory:
+            return {'error': 'Memory not found'}
+        
+        # 2. 查找触发的待办
+        triggered_todos = await self.db.query("""
+            SELECT t.*, ml.context as trigger_context, ml.created_at as triggered_at
+            FROM todos t
+            JOIN memory_links ml ON ml.target_id = t.id AND ml.target_type = 'todo'
+            WHERE ml.source_id = $1 
+              AND ml.link_type = 'triggered'
+              AND ml.source_type = 'memory'
+        """, memory_id)
+        
+        # 3. 查找验证关系
+        verifications = await self.db.query("""
+            SELECT t.*, ml.context as verification_context, 
+                   ml.created_at as verified_at
+            FROM memory_links ml
+            JOIN todos t ON ml.source_id = t.id AND ml.source_type = 'todo'
+            WHERE ml.target_id = $1 
+              AND ml.link_type = 'verified'
+              AND ml.target_type = 'memory'
+        """, memory_id)
+        
+        # 4. 判断验证状态
+        verified_todos = [v for v in verifications if v['status'] == 'completed']
+        pending_todos = [t for t in triggered_todos if t['status'] == 'pending']
+        in_progress_todos = [t for t in triggered_todos if t['status'] == 'in_progress']
+        
+        if verified_todos:
+            status = 'verified'
+            latest_verification = verified_todos[0]
+        elif in_progress_todos:
+            status = 'in_progress'
+            latest_verification = in_progress_todos[0]
+        elif pending_todos:
+            status = 'pending'
+            latest_verification = None
+        else:
+            status = 'unverified'
+            latest_verification = None
+        
+        return {
+            'memory': {
+                'id': memory['id'],
+                'content': memory['content'],
+                'source_date': memory['source_date'],
+                'tags': memory.get('tags', [])
+            },
+            'status': status,
+            'triggered_todos': triggered_todos,
+            'verifications': verifications,
+            'verified': len(verified_todos) > 0,
+            'latest_verification': latest_verification,
+            'summary': self._build_summary(status, memory, verified_todos)
+        }
+    
+    def _build_summary(self, status: str, memory: Dict, verified_todos: List) -> str:
+        """构建验证摘要"""
+        
+        if status == 'verified' and verified_todos:
+            todo = verified_todos[0]
+            return f"✅ 已验证: {todo.get('title')} (完成于 {todo.get('completed_at')})"
+        elif status == 'in_progress':
+            return f"🔄 进行中: {len(verified_todos)} 个待办正在处理"
+        elif status == 'pending':
+            return f"⏳ 待处理: 记忆有待办待执行"
+        else:
+            return "❓ 未验证: 暂无关联的待办"
+    
+    async def verify_by_query(self, query: str) -> Dict:
+        """通过自然语言查询验证记忆
+        
+        用户问: "上次那个部署问题解决了吗?"
+        """
+        
+        # 1. 搜索相关记忆
+        memories = await self.db.search_memories(query, limit=5)
+        
+        if not memories:
+            return {'error': '未找到相关记忆', 'query': query}
+        
+        # 2. 对每个记忆进行验证
+        results = []
+        for memory in memories:
+            verification = await self.verify_memory(memory['id'])
+            results.append(verification)
+        
+        # 3. 返回最相关的验证结果
+        verified_results = [r for r in results if r.get('verified')]
+        
+        if verified_results:
+            return verified_results[0]
+        elif results:
+            return results[0]
+        
+        return {'error': '验证失败'}
+    
+    async def auto_link_on_create(self, entity_type: str, entity_id: str, data: Dict):
+        """创建实体时自动建立关联
+        
+        触发时机:
+        - memory 创建时
+        - todo 创建时
+        - todo 状态变更时
+        """
+        
+        if entity_type == 'memory':
+            await self._link_memory_with_todos(entity_id, data)
+            await self._link_memory_with_lessons(entity_id, data)
+            await self._link_similar_memories(entity_id, data)
+        
+        elif entity_type == 'todo':
+            if data.get('status') == 'completed':
+                await self._create_verification_links(entity_id, data)
+    
+    async def _link_memory_with_todos(self, memory_id: str, memory_data: Dict):
+        """记忆关联待办"""
+        
+        source_date = memory_data.get('source_date')
+        if not source_date:
+            return
+        
+        # 查找同日期待办
+        todos = await self.db.find_todos(due_date=source_date)
+        
+        for todo in todos:
+            # 检查关键词重叠
+            memory_keywords = set(memory_data.get('content', '').split())
+            todo_keywords = set(todo.get('title', '').split())
+            
+            overlap = memory_keywords & todo_keywords
+            
+            if overlap:
+                await self.db.create_link(
+                    source_id=memory_id,
+                    source_type='memory',
+                    target_id=todo['id'],
+                    target_type='todo',
+                    link_type='triggered',
+                    strength=min(0.3 + 0.1 * len(overlap), 1.0),
+                    context=f"关键词重叠: {', '.join(overlap)}"
+                )
+    
+    async def _link_memory_with_lessons(self, memory_id: str, memory_data: Dict):
+        """记忆关联经验教训"""
+        
+        memory_tags = set(memory_data.get('tags', []))
+        
+        # 查找相关标签的经验教训
+        lessons = await self.db.find_lessons_by_tags(list(memory_tags))
+        
+        for lesson in lessons:
+            # 计算关联强度
+            lesson_tags = set(lesson.get('tags', []))
+            overlap = memory_tags & lesson_tags
+            
+            if overlap:
+                await self.db.create_link(
+                    source_id=memory_id,
+                    source_type='memory',
+                    target_id=lesson['id'],
+                    target_type='lesson',
+                    link_type='related',
+                    strength=len(overlap) / max(len(memory_tags | lesson_tags), 1),
+                    context=f"标签重叠: {', '.join(overlap)}"
+                )
+    
+    async def _link_similar_memories(self, memory_id: str, memory_data: Dict):
+        """关联相似记忆"""
+        
+        # 使用向量相似度查找相似记忆
+        similar = await self.db.find_similar_memories(
+            memory_id=memory_id,
+            threshold=0.7,
+            limit=5
+        )
+        
+        for sim in similar:
+            await self.db.create_link(
+                source_id=memory_id,
+                source_type='memory',
+                target_id=sim['id'],
+                target_type='memory',
+                link_type='related',
+                strength=sim['similarity'],
+                context="语义相似"
+            )
+    
+    async def _create_verification_links(self, todo_id: str, todo_data: Dict):
+        """待办完成时创建验证链接"""
+        
+        source_memory_ids = todo_data.get('source_memory_ids', [])
+        
+        for memory_id in source_memory_ids:
+            # 检查是否已存在验证链接
+            existing = await self.db.query("""
+                SELECT id FROM memory_links
+                WHERE source_id = $1 AND source_type = 'todo'
+                  AND target_id = $2 AND target_type = 'memory'
+                  AND link_type = 'verified'
+            """, todo_id, memory_id)
+            
+            if not existing:
+                await self.db.create_link(
+                    source_id=todo_id,
+                    source_type='todo',
+                    target_id=memory_id,
+                    target_type='memory',
+                    link_type='verified',
+                    strength=1.0,
+                    context=f"待办完成验证: {todo_data.get('title')}"
+                )
+        
+        # 同时验证相关的记忆
+        related_memory_ids = todo_data.get('related_memory_ids', [])
+        
+        for memory_id in related_memory_ids:
+            if memory_id not in source_memory_ids:
+                await self.db.create_link(
+                    source_id=todo_id,
+                    source_type='todo',
+                    target_id=memory_id,
+                    target_type='memory',
+                    link_type='verified',
+                    strength=0.8,
+                    context=f"相关待办验证: {todo_data.get('title')}"
+                )
+```
+5.4 自动关联规则引擎
+from typing import Callable, Dict, List
+from dataclasses import dataclass
+
+
+@dataclass
+class LinkRule:
+    """关联规则定义"""
+    name: str
+    condition: Callable  # 条件函数
+    link_type: str
+    source_types: List[str]  # 源实体类型
+    target_types: List[str]  # 目标实体类型
+    strength_calc: Callable = None  # 强度计算函数
+    context_calc: Callable = None   # 上下文生成函数
+
+
+class AutoLinker:
+    """自动关联规则引擎"""
+    
+    RULES = [
+        # 规则1: 记忆触发待办
+        LinkRule(
+            name="memory_triggers_todo",
+            condition=lambda src, tgt: (
+                src['type'] == 'memory' and tgt['type'] == 'todo' and
+                src.get('source_date') == tgt.get('due_date') and
+                self._keyword_overlap(src.get('content', ''), tgt.get('title', ''))
+            ),
+            link_type='triggered',
+            source_types=['memory'],
+            target_types=['todo'],
+            strength_calc=lambda src, tgt: 0.7 + 0.1 * len(self._keyword_overlap(src.get('content', ''), tgt.get('title', '')))
+        ),
+        
+        # 规则2: 待办验证记忆
+        LinkRule(
+            name="todo_verifies_memory",
+            condition=lambda src, tgt: (
+                src['type'] == 'todo' and tgt['type'] == 'memory' and
+                src.get('status') == 'completed' and
+                tgt['id'] in src.get('source_memory_ids', [])
+            ),
+            link_type='verified',
+            source_types=['todo'],
+            target_types=['memory'],
+            strength_calc=lambda src, tgt: 1.0
+        ),
+        
+        # 规则3: 提炼记忆派生自原始记忆
+        LinkRule(
+            name="refined_derived_from_raw",
+            condition=lambda src, tgt: (
+                src['type'] == 'memory' and tgt['type'] == 'memory' and
+                src.get('atom_type') in ['refined_weekly', 'refined_monthly'] and
+                tgt['id'] in src.get('refined_from', [])
+            ),
+            link_type='derived',
+            source_types=['memory'],
+            target_types=['memory'],
+            strength_calc=lambda src, tgt: 1.0
+        ),
+        
+        # 规则4: 经验教训引用源
+        LinkRule(
+            name="lesson_references_source",
+            condition=lambda src, tgt: (
+                src['type'] == 'lesson' and tgt['type'] in ['memory', 'todo'] and
+                tgt['id'] in src.get('source_memory_ids', []) or
+                tgt['id'] in src.get('source_todo_ids', [])
+            ),
+            link_type='references',
+            source_types=['lesson'],
+            target_types=['memory', 'todo'],
+            strength_calc=lambda src, tgt: 0.9
+        ),
+        
+        # 规则5: 文件关联记忆
+        LinkRule(
+            name="file_linked_to_memory",
+            condition=lambda src, tgt: (
+                src['type'] == 'file' and tgt['type'] == 'memory' and
+                src.get('created_at').date() == tgt.get('source_date') and
+                self._filename_content_match(src.get('filename', ''), tgt.get('content', ''))
+            ),
+            link_type='linked_file',
+            source_types=['file'],
+            target_types=['memory'],
+            strength_calc=lambda src, tgt: 0.7
+        ),
+        
+        # 规则6: 同项目关联
+        LinkRule(
+            name="same_project_entities",
+            condition=lambda src, tgt: (
+...(truncated)...
+
+好的，继续输出：
+
+---
+
+## 5.4 自动关联规则引擎 (继续)
+
+```python
+    async def _encode_text(self, text: str) -> List[float]:
+        """编码文本为向量"""
+        # 这里调用实际的 embedding 服务
+        return await self.embedding.encode(text)
+    
+    def _format_size(self, bytes_size: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_size < 1024:
+                return f"{bytes_size:.2f} {unit}"
+            bytes_size /= 1024
+        return f"{bytes_size:.2f} PB"
+```
+
+---
+
+## 6. 非结构化数据关联方案 (完整版)
+
+### 6.3 统一召回实现 (继续)
+
+```python
+            # 上下文增强 (当前会话相关)
+            if context:
+                # 如果结果与活跃项目相关
+                if data['metadata'].get('project_id') == context.get('active_project_id'):
+                    final_score *= 1.2
+                
+                # 如果结果与最近记忆相关
+                if any(self._is_related(item['title'], context.get('recent_memories', [])) 
+                       for item in [data]):
+                    final_score *= 1.15
+            
+            # 时间衰减
+            if data.get('created_at'):
+                days_old = (datetime.now() - data['created_at']).days
+                if days_old < 7:
+                    final_score *= 1.1
+                elif days_old > 365:
+                    final_score *= 0.8
+            
+            data['final_score'] = final_score
+            final_results.append(data)
+        
+        # 排序返回
+        return sorted(final_results, key=lambda x: x['final_score'], reverse=True)
+    
+    def _is_related(self, title: str, recent_memories: List[str]) -> bool:
+        """判断是否与最近记忆相关"""
+        for mem in recent_memories:
+            if mem.lower() in title.lower() or title.lower() in mem.lower():
+                return True
+        return False
+
+
+class QueryOptimizer:
+    """查询优化器 - 缓存与预热"""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    async def get_cached_results(self, query_hash: str) -> Optional[Dict]:
+        """获取缓存结果"""
+        
+        cache_key = f"recall:{query_hash}"
+        cached = await self.redis.get(cache_key)
+        
+        if cached:
+            return json.loads(cached)
+        
+        return None
+    
+    async def cache_results(self, query_hash: str, results: Dict, ttl: int = 3600):
+        """缓存结果"""
+        
+        cache_key = f"recall:{query_hash}"
+        await self.redis.setex(cache_key, ttl, json.dumps(results))
+    
+    async def warm_up(self, popular_queries: List[str]):
+        """预热热门查询"""
+        
+        recall = UnifiedRecall(self.pg, self.es, self.neo4j, self.redis)
+        
+        for query in popular_queries:
+            try:
+                results = await recall.recall(query, limit=20)
+                query_hash = str(hash(query))
+                await self.cache_results(query_hash, results)
+            except:
+                pass
+```
+
+### 6.4 跨库联合检索 SQL
+
+```sql
+-- 跨库联合检索: 搜索 "三体" 相关的所有内容
+
+-- 1. 搜索文件
+SELECT 
+    'file' as result_type,
+    f.id,
+    f.filename as title,
+    f.file_size,
+    f.file_size_display,
+    f.format,
+    f.resolution,
+    f.user_description as description,
+    f.user_tags,
+    f.created_at,
+    -- 文件特有字段
+    f.duration,
+    f.stored_path,
+    -- 相似度计算 (向量 + 关键词)
+    COALESCE(1 - (f.embedding <=> $query_embedding), 0) * 0.7 +
+    CASE WHEN f.filename ILIKE '%三体%' THEN 0.2 ELSE 0 END +
+    CASE WHEN f.user_tags && ARRAY['三体']::text[] THEN 0.1 ELSE 0 END
+    as relevance_score
+FROM file_metadata f
+WHERE 
+    f.filename ILIKE '%三体%' 
+    OR f.user_description ILIKE '%三体%'
+    OR f.user_tags && ARRAY['三体']::text[]
+    OR f.embedding <=> $query_embedding < 0.3
+
+UNION ALL
+
+-- 2. 搜索记忆
+SELECT 
+    'memory' as result_type,
+    m.id,
+    LEFT(m.content, 100) as title,
+    NULL as file_size,
+    NULL as file_size_display,
+    NULL as format,
+    NULL as resolution,
+    m.content as description,
+    m.tags as user_tags,
+    m.created_at,
+    -- 记忆特有字段
+    NULL as duration,
+    NULL as stored_path,
+    -- 相似度
+    COALESCE(1 - (m.embedding <=> $query_embedding), 0) * 0.7 +
+    CASE WHEN m.content ILIKE '%三体%' THEN 0.2 ELSE 0 END +
+    CASE WHEN m.tags && ARRAY['三体']::text[] THEN 0.1 ELSE 0 END
+    as relevance_score
+FROM memory_atoms m
+WHERE 
+    m.content ILIKE '%三体%'
+    OR m.tags && ARRAY['三体']::text[]
+    OR m.embedding <=> $query_embedding < 0.3
+
+UNION ALL
+
+-- 3. 搜索经验教训
+SELECT 
+    'lesson' as result_type,
+    l.id,
+    l.title as title,
+    NULL as file_size,
+    NULL as file_size_display,
+    NULL as format,
+    NULL as resolution,
+    l.content as description,
+    l.tags as user_tags,
+    l.created_at,
+    NULL as duration,
+    NULL as stored_path,
+    -- 相似度
+    CASE WHEN l.title ILIKE '%三体%' THEN 0.8 
+         WHEN l.content ILIKE '%三体%' THEN 0.6 
+         ELSE 0.3 END
+    as relevance_score
+FROM lessons l
+WHERE 
+    l.title ILIKE '%三体%'
+    OR l.content ILIKE '%三体%'
+    OR l.tags && ARRAY['三体']::text[]
+
+ORDER BY relevance_score DESC, created_at DESC
+LIMIT 20;
+```
+
+### 6.5 文件召回示例
+
+```python
+# 完整召回示例
+
+async def recall_file_example():
+    """场景: 用户说 "我想看三体电影" """
+    
+    recall = UnifiedRecall(pg_client, es_client, neo4j_client, redis_client)
+    
+    # 执行召回
+    result = await recall.recall(
+        query="我想看三体电影",
+        type_filter=['file', 'memory'],
+        filters={
+            'format': ['mp4', 'mkv'],
+            'size_min': 1000000000  # 1GB
+        },
+        context={
+            'recent_memories': ['保存了三体电影'],
+            'active_project_id': None
+        },
+        limit=10
+    )
+    
+    print("=== 查询理解 ===")
+    print(result['query_understanding'])
+    # {
+    #   'original_query': '我想看三体电影',
+    #   'keywords': ['三体', '电影'],
+    #   'intent': 'play',
+    #   'size_range': None,
+    #   'formats': ['mp4', 'mkv']
+    # }
+    
+    print("\n=== 召回结果 ===")
+    for item in result['results']:
+        print(f"\n类型: {item['type']}")
+        print(f"标题: {item['title']}")
+        print(f"分数: {item['final_score']:.2f}")
+        
+        if item['type'] == 'file':
+            print(f"大小: {item['metadata'].get('file_size_display')}")
+            print(f"分辨率: {item['metadata'].get('resolution')}")
+            print(f"存储路径: {item['metadata'].get('stored_path')}")
+    
+    # 输出:
+    # === 召回结果 ===
+    #
+    # 类型: file
+    # 标题: 三体.mp4
+    # 分数: 0.92
+    # 大小: 8.21 GB
+    # 分辨率: 1920x1080
+    # 存储路径: minio://files/20260319/三体.mp4
+    #
+    # 类型: file
+    # 标题: 三体第二部.mkv
+    # 分数: 0.78
+    # 大小: 6.53 GB
+    # 分辨率: 1920x1080
+    # 存储路径: minio://files/20260319/三体第二部.mkv
+    #
+    # 类型: memory
+    # 标题: 用户保存了《三体》电影, 大小8GB
+    # 分数: 0.71
+    # 描述: 用户保存了《三体》电影, 大小8GB, 描述: 三体电影
+
+
+# 场景2: 精确大小查询
+async def recall_by_size_example():
+    """场景: 用户说 "帮我找那个8GB的三体视频" """
+    
+    recall = UnifiedRecall(pg_client, es_client, neo4j_client, redis_client)
+    
+    result = await recall.recall(
+        query="帮我找那个8GB的三体视频",
+        type_filter=['file'],
+        filters={},
+        limit=10
+    )
+    
+    # 查询理解会自动提取:
+    # - size_range: {min: 7000000000, max: 9000000000} (8GB ±20%)
+    # - keywords: ['三体', '视频']
+    # - formats: ['mp4', 'mkv', 'avi']
+    
+    print(result['query_understanding'])
+    # {
+    #   'keywords': ['三体', '视频'],
+    #   'size_range': {'min': 6871947673, 'max': 10200547327, 'display': '8GB'},
+    #   'formats': ['mp4', 'mkv']
+    # }
+```
+
+### 6.6 文件生命周期管理
+
+```python
+class FileLifecycleManager:
+    """文件生命周期管理"""
+    
+    def __init__(self, db_client, minio_client, storage_quota_gb: int = 100):
+        self.db = db_client
+        self.minio = minio_client
+        self.quota = storage_quota_gb * 1024**3
+    
+    async def check_storage_quota(self) -> Dict:
+        """检查存储配额"""
+        
+        total_size = await self.db.query("""
+            SELECT COALESCE(SUM(file_size), 0) as total 
+            FROM file_metadata
+        """)
+        
+        used = total_size[0]['total']
+        available = self.quota - used
+        
+        return {
+            'quota_gb': self.quota / 1024**3,
+            'used_gb': used / 1024**3,
+            'available_gb': available / 1024**3,
+            'usage_percent': (used / self.quota) * 100
+        }
+    
+    async def find_duplicate_files(self) -> List[Dict]:
+        """查找重复文件 (MD5 相同)"""
+        
+        duplicates = await self.db.query("""
+            SELECT md5_hash, array_agg(id) as file_ids, 
+                   array_agg(filename) as filenames,
+                   COUNT(*) as count,
+                   MAX(file_size) as file_size
+            FROM file_metadata
+            WHERE md5_hash IS NOT NULL
+            GROUP BY md5_hash
+            HAVING COUNT(*) > 1
+        """)
+        
+        return duplicates
+    
+    async def cleanup_unlinked_files(self, days: int = 30) -> int:
+        """清理未关联的记忆的孤立文件"""
+        
+        # 查找超过 days 天没有关联记忆的文件
+        unlinked = await self.db.query("""
+            SELECT id, filename, stored_path
+            FROM file_metadata
+            WHERE memory_id IS NULL
+              AND created_at < NOW() - INTERVAL '%s days'
+        """, days)
+        
+        deleted_count = 0
+        for file in unlinked:
+            # 从 MinIO 删除
+            if file['stored_path']:
+                await self.minio.delete_object(file['stored_path'])
+            
+            # 从数据库删除
+            await self.db.delete_file(file['id'])
+            deleted_count += 1
+        
+        return deleted_count
+    
+    async def archive_old_files(self, days: int = 365, archive_tier: str = 'cold'):
+        """归档旧文件 (转移到冷存储)"""
+        
+        old_files = await self.db.query("""
+            SELECT id, filename, stored_path
+            FROM file_metadata
+            WHERE created_at < NOW() - INTERVAL '%s days'
+              AND storage_tier = 'hot'
+        """, days)
+        
+        for file in old_files:
+            # 移动到冷存储
+            new_path = await self.minio.move_to_cold_storage(file['stored_path'])
+            
+            # 更新数据库
+            await self.db.update_file(file['id'], {
+                'stored_path': new_path,
+                'storage_tier': 'cold',
+                'archived_at': datetime.now()
+            })
+        
+        return len(old_files)
+```
+
+### 6.7 全文搜索索引设计 (Elasticsearch)
+
+```json
+// memories 索引映射
+{
+  "mappings": {
+    "properties": {
+      "content": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "tags": {
+        "type": "text",
+        "analyzer": "ik_max_word"
+      },
+      "atom_type": {
+        "type": "keyword"
+      },
+      "source_date": {
+        "type": "date"
+      },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1536,
+        "index": true,
+        "similarity": "cosine"
+      }
+    }
+  }
+}
+
+// files 索引映射
+{
+  "mappings": {
+    "properties": {
+      "filename": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "user_description": {
+        "type": "text",
+        "analyzer": "ik_max_word"
+      },
+      "user_tags": {
+        "type": "text",
+        "analyzer": "ik_max_word"
+      },
+      "format": {
+        "type": "keyword"
+      },
+      "file_size": {
+        "type": "long"
+      },
+      "resolution": {
+        "type": "keyword"
+      },
+      "duration": {
+        "type": "float"
+      },
+      "location_name": {
+        "type": "text",
+        "analyzer": "ik_max_word"
+      },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1536,
+        "index": true,
+        "similarity": "cosine"
+      },
+      "created_at": {
+        "type": "date"
+      }
+    }
+  }
+}
+```
+
+### 6.8 关系图谱模型 (Neo4j)
+
+```cypher
+// 创建节点类型
+
+// 记忆节点
+CREATE CONSTRAINT memory_id IF NOT EXISTS
+FOR (m:Memory) REQUIRE m.id IS UNIQUE;
+
+// 待办节点
+CREATE CONSTRAINT todo_id IF NOT EXISTS
+FOR (t:Todo) REQUIRE t.id IS UNIQUE;
+
+// 经验教训节点
+CREATE CONSTRAINT lesson_id IF NOT EXISTS
+FOR (l:Lesson) REQUIRE l.id IS UNIQUE;
+
+// 文件节点
+CREATE CONSTRAINT file_id IF NOT EXISTS
+FOR (f:File) REQUIRE f.id IS UNIQUE;
+
+// 项目节点
+CREATE CONSTRAINT project_id IF NOT EXISTS
+FOR (p:Project) REQUIRE p.id IS UNIQUE;
+
+
+
+
+
+
+
+// 创建关系类型
+
+// 记忆 -> 记忆: RELATED (语义相关)
+MATCH (m1:Memory), (m2:Memory)
+WHERE m1.id = $id1 AND m2.id = $id2
+CREATE (m1)-[r:RELATED {strength: 0.8, context: '语义相似'}]->(m2);
+
+// 记忆 -> 待办: TRIGGERED (触发)
+MATCH (m:Memory), (t:Todo)
+WHERE m.id = $memory_id AND t.id = $todo_id
+CREATE (m)-[r:TRIGGERED {strength: 0.8, context: $context}]->(t);
+
+// 待办 -> 记忆: VERIFIED (验证)
+MATCH (t:Todo), (m:Memory)
+WHERE t.id = $todo_id AND m.id = $memory_id
+CREATE (t)-[r:VERIFIED {strength: 1.0, context: $context}]->(m);
+
+// 记忆 -> 文件: LINKED (关联)
+MATCH (m:Memory), (f:File)
+WHERE m.id = $memory_id AND f.id = $file_id
+CREATE (m)-[r:LINKED {strength: 0.7}]->(f);
+
+// 经验教训 -> 记忆: REFERENCES (引用)
+MATCH (l:Lesson), (m:Memory)
+WHERE l.id = $lesson_id AND m.id = $memory_id
+CREATE (l)-[r:REFERENCES {strength: 0.9}]->(m);
+
+
+// 图查询示例
+
+// 1. 查找与"三体"相关的所有实体
+MATCH (n)-[r]-(m)
+WHERE m.content CONTAINS '三体' OR m.title CONTAINS '三体' OR m.filename CONTAINS '三体'
+RETURN n, r, labels(n) as type
+LIMIT 50;
+
+// 2. 查找记忆的完整关联图
+MATCH path = (m:Memory {id: $memory_id})-[*1..2]-(n)
+RETURN path;
+
+// 3. 查找项目的所有关联
+MATCH (p:Project {id: $project_id})-[r]-(n)
+RETURN p, r, n;
+```
+
+---
+
+7. Kafka 消息同步设计
+7.1 Topic 设计 (续)
+Topic	Key	Partitions	消费者	说明
+memory_events	atom_id	3	ES, Neo4j, Redis	记忆CRUD事件
+file_events	file_id	3	ES, 向量服务	文件元数据事件
+link_events	link_id	3	Neo4j, 缓存	关联关系事件
+todo_events	todo_id	2	记忆服务, 通知	待办状态事件
+lesson_events	lesson_id	2	ES, 统计	经验教训事件
+refine_events	date	1	提炼服务	定时提炼触发
+7.2 消息格式 (续)
+// todo_events
+{
+  "event_id": "uuid",
+  "event_type": "created|status_changed|completed|cancelled",
+  "todo_id": "880e8400-e29b-41d4-a716-446655440003",
+  "payload": {
+    "title": "修复数据库连接问题",
+    "description": "修改 DATABASE_URL 配置",
+    "status": "completed",
+    "priority": "high",
+    "due_date": "2026-03-15",
+    "completed_at": "2026-03-15T14:30:00Z",
+    "source_memory_ids": ["550e8400-e29b-41d4-a716-446655440000"],
+    "related_memory_ids": ["550e8400-e29b-41d4-a716-446655440001"]
+  },
+  "timestamp": "2026-03-15T14:30:00Z",
+  "source": "api"
+}
+
+// lesson_events
+{
+  "event_id": "uuid",
+  "event_type": "created|updated|referenced",
+  "lesson_id": "990e8400-e29b-41d4-a716-446655440004",
+  "payload": {
+    "title": "[部署] 修改配置后需重启服务",
+    "content": "修改 .env 中的 DATABASE_URL 后必须使用 docker-compose restart 重启服务",
+    "category": "deployment",
+    "tags": ["部署", "配置", "重启"],
+    "source_memory_ids": ["550e8400-e29b-41d4-a716-446655440000"],
+    "source_todo_ids": ["880e8400-e29b-41d4-a716-446655440003"]
+  },
+  "timestamp": "2026-03-15T14:35:00Z",
+  "source": "auto_generator"
+}
+
+// refine_events (定时触发)
+{
+  "event_id": "uuid",
+  "event_type": "trigger_weekly|refresh_monthly",
+  "refine_type": "weekly|monthly",
+  "target_date": "2026-03-19",
+  "date_range": {
+    "start": "2026-03-13",
+    "end": "2026-03-19"
+  },
+  "timestamp": "2026-03-19T02:00:00Z",
+  "source": "scheduler"
+}
+7.3 消费者实现
+# 消费者组设计
+CONSUMER_GROUPS = {
+    'memory_events': ['es_indexer', 'neo4j_syncer', 'redis_cache'],
+    'file_events': ['es_indexer', 'vector_indexer'],
+    'link_events': ['neo4j_syncer', 'cache_invalidator'],
+    'todo_events': ['memory_linker', 'notifier'],
+    'lesson_events': ['es_indexer', 'stats_collector'],
+    'refine_events': ['refine_worker']
+}
+
+# 示例: Memory Events 消费者
+class MemoryEventConsumer:
+    async def consume(self):
+        consumer = KafkaConsumer(
+            'memory_events',
+            bootstrap_servers=['localhost:9092'],
+            group_id='es_indexer',
+            value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+        )
+        
+        async for message in consumer:
+            event = message.value
+            
+            if event['event_type'] == 'created':
+                await self._index_to_elasticsearch(event['payload'])
+                await self._sync_to_neo4j(event['payload'])
+                await self._cache_to_redis(event['payload'])
+                
+            elif event['event_type'] == 'updated':
+                await self._reindex_elasticsearch(event['atom_id'])
+                await self._update_neo4j(event['payload'])
+                
+            elif event['event_type'] == 'deleted':
+                await self._delete_from_elasticsearch(event['atom_id'])
+                await self._delete_from_neo4j(event['atom_id'])
+    
+    async def _index_to_elasticsearch(self, payload):
+        """索引到 ES"""
+        await es_client.index(
+            index='memories',
+            id=payload['atom_id'],
+            document={
+                'content': payload['content'],
+                'tags': payload.get('tags', []),
+                'atom_type': payload['atom_type'],
+                'source_date': payload.get('source_date'),
+                'metadata': payload.get('metadata', {}),
+                'embedding': payload.get('embedding')
+            }
+        )
+    
+    async def _sync_to_neo4j(self, payload):
+        """同步到 Neo4j"""
+        await neo4j_client.execute(
+            """
+            CREATE (m:Memory {
+                id: $id,
+                content: $content,
+                atom_type: $atom_type,
+                created_at: $created_at
+            })
+            """,
+            id=payload['atom_id'],
+            content=payload['content'],
+            atom_type=payload['atom_type'],
+            created_at=payload.get('created_at', datetime.now())
+        )
+7.4 消息顺序与幂等性
+# 消息顺序保证
+class OrderedConsumer:
+    """
+    同 ID 的消息必须按顺序处理
+    使用单分区 + 按 key 哈希保证顺序
+    """
+    
+    async def consume(self):
+        # 按 atom_id 分区，保证同一记忆的消息有序
+        consumer = KafkaConsumer(
+            'memory_events',
+            bootstrap_servers=['localhost:9092'],
+            group_id='ordered_processor',
+            partition_assignment_strategy=RoundRobinPartitionAssignor
+        )
+        
+        # 本地消息排序缓冲区
+        pending = {}  # {atom_id: [messages...]}
+        
+        async for message in consumer:
+            event = message.value
+            key = event.get('atom_id') or event.get('file_id')
+            
+            if key not in pending:
+                pending[key] = []
+            pending[key].append(event)
+            
+            # 按时间戳排序后处理
+            pending[key].sort(key=lambda x: x['timestamp'])
+            
+            # 处理最早的消息
+            if self._is_ready_to_process(pending[key]):
+                await self._process(pending[key].pop(0))
+    
+    def _is_ready_to_process(self, messages):
+        """检查是否可以处理"""
+        if not messages:
+            return False
+        # 只有第一条消息没有前置依赖时才处理
+        return True
+
+# 幂等性处理
+class IdempotentProcessor:
+    """使用事件 ID 去重"""
+    
+    def __init__(self):
+        self.processed = RedisSet('processed_events:ttl:86400')
+    
+    async def process(self, event):
+        event_id = event['event_id']
+        
+        # 检查是否已处理
+        if await self.processed.exists(event_id):
+            logger.info(f"跳过重复事件: {event_id}")
+            return
+        
+        # 处理业务逻辑
+        await self._do_process(event)
+        
+        # 标记已处理
+        await self.processed.add(event_id)
+8. API 设计 (扩展现有 API)
+8.1 新增端点总览
+分类	方法	路径	说明
+融合召回	POST	/api/recall	统一融合召回入口
+记忆管理	POST	/api/memories/refine	手动触发提炼
+记忆管理	GET	/api/memories/verify/<id>	验证记忆状态
+待办管理	POST	/api/todos	创建待办
+待办管理	GET	/api/todos	列表待办
+待办管理	PUT	/api/todos/<id>	更新待办
+待办管理	PUT	/api/todos/<id>/complete	完成待办
+经验教训	POST	/api/lessons	创建经验教训
+经验教训	GET	/api/lessons	搜索经验教训
+经验教训	GET	/api/lessons/<id>	获取详情
+文件管理	POST	/api/files	上传文件+元数据
+文件管理	GET	/api/files	搜索文件
+文件管理	GET	/api/files/<id>	获取文件详情
+文件管理	GET	/api/files/<id>/download	下载文件
+项目管理	POST	/api/projects	创建项目
+项目管理	GET	/api/projects	列表项目
+关联查询	GET	/api/links	查询关联关系
+关联查询	GET	/api/links/source/<id>	获取源关联
+关联查询	GET	/api/links/target/<id>	获取目标关联
+8.2 融合召回 API 详情
+# POST /api/recall
+# 统一融合召回入口
+
+请求:
+  {
+    "query": "string",                    # 查询语句 (必填)
+    "type_filter": ["memory", "file", "lesson", "todo"],  # 检索类型
+    "channels": {                         # 召回通道配置
+      "semantic": true,                  # 向量召回 (默认开启)
+      "keyword": true,                   # 关键词召回 (默认开启)
+      "graph": true,                     # 图谱召回 (默认开启)
+      "metadata": true                   # 元数据过滤 (默认开启)
+    },
+    "filters": {                         # 精确过滤条件
+      "date_range": {
+        "start": "2026-01-01",
+        "end": "2026-03-19"
+      },
+      "tags": ["三体", "电影"],
+      "file_size": {
+        "min": 1000000000,               # 最小 1GB
+        "max": 10000000000               # 最大 10GB
+      },
+      "format": ["mp4", "mkv"],
+      "importance": 0.5
+    },
+    "context": {                         # 上下文 (可选)
+      "session_memory_ids": ["uuid1"],   # 当前会话相关记忆
+      "active_project_id": "uuid",       # 活跃项目
+      "recent_memories": ["uuid1"]       # 最近记忆
+    },
+    "limit": 20,                         # 返回数量 (默认20)
+    "offset": 0                          # 偏移量
+  }
+
+响应 (200):
+  {
+    "query_understanding": {
+      "entities": [
+        {"type": "keyword", "value": "三体", "position": 0},
+        {"type": "size", "value": "8GB", "range": [7000000000, 9000000000]},
+        {"type": "category", "value": "电影", "category": "video"}
+      ],
+      "intent": "recall_file",
+      "interpreted_query": "查找与'三体'相关的视频文件, 大小约8GB"
+    },
+    "results": [
+      {
+        "type": "file",
+        "sub_type": "video",
+        "id": "uuid",
+        "title": "三体.mp4",
+        "filename": "三体.mp4",
+        "file_size": 8589934592,
+        "file_size_display": "8.21 GB",
+        "resolution": "1920x1080",
+        "duration": 8760.5,
+        "duration_display": "2h 26m",
+        "format": "mp4",
+        "description": "三体电影",
+        "tags": ["三体", "电影", "科幻"],
+        "score": 0.95,
+        "channels": ["semantic", "keyword", "metadata"],
+        "metadata_matches": ["size_range", "filename_keyword", "tag_match"],
+        "created_at": "2026-03-19T06:00:00Z",
+        "preview_url": "/api/files/uuid/preview"
+      },
+      {
+        "type": "memory",
+        "sub_type": "raw_daily",
+        "id": "uuid",
+        "content": "用户保存了《三体》电影文件, 大小8GB",
+        "tags": ["三体", "电影", "视频"],
+        "source_date": "2026-03-19",
+        "score": 0.82,
+        "channels": ["semantic", "keyword"],
+        "created_at": "2026-03-19T06:00:00Z"
+      }
+    ],
+    "meta": {
+      "total": 15,
+      "returned": 2,
+      "channels_used": ["semantic", "keyword", "metadata"],
+      "query_time_ms": 127,
+      "breakdown": {
+        "semantic": 12,
+        "keyword": 8,
+        "graph": 5,
+        "metadata": 3
+      }
+    }
+  }
+
+错误响应 (400):
+  {
+    "error": "invalid_query",
+    "message": "查询不能为空",
+    "details": {
+      "field": "query",
+      "constraint": "min_length: 1"
+    }
+  }
+8.3 记忆管理 API
+# POST /api/memories
+# 创建记忆 (已有)
+
+# POST /api/memories/refine
+# 手动触发提炼
+
+请求:
+  {
+    "type": "weekly|monthly",           # 提炼类型
+    "start_date": "2026-03-13",         # 开始日期
+    "end_date": "2026-03-19",           # 结束日期
+    "force": false                       # 是否强制重新提炼
+  }
+
+响应 (200):
+  {
+    "refined_memory": {
+      "id": "uuid",
+      "atom_type": "refined_weekly",
+      "content": "本周完成了数据库重构, 解决了部署问题...",
+      "key_points": [
+        "完成数据库 schema 优化",
+        "修复了 DATABASE_URL 配置问题",
+        "建立了文件元数据管理"
+      ],
+      "refined_period": "weekly_2026_12",
+      "refined_from": ["uuid1", "uuid2", ...],
+      "tags": ["本周总结", "技术"],
+      "created_at": "2026-03-19T10:00:00Z"
+    },
+    "links_created": 7
+  }
+
+# GET /api/memories/verify/<id>
+# 验证记忆状态
+
+响应 (200):
+  {
+    "memory": {
+      "id": "uuid",
+      "content": "部署时数据库连接失败",
+      "source_date": "2026-03-15"
+    },
+    "verification": {
+      "status": "verified",
+      "verified_by": {
+        "type": "todo",
+        "id": "todo_uuid",
+        "title": "修复数据库连接问题",
+        "status": "completed",
+        "completed_at": "2026-03-15T14:30:00Z"
+      },
+      "verified_at": "2026-03-15T14:30:00Z",
+      "verification_type": "problem_resolved"
+    },
+    "related": {
+      "lessons": [
+        {"id": "uuid", "title": "[部署] 修改配置后需重启服务"}
+      ],
+      "files": [],
+      "memories": []
+    }
+  }
+8.4 待办管理 API
+
+
+
+
+
+
+9. 数据流转架构
+┌─────────────────────────────────────────────────────────────────────┐
+│                           用户交互层                                 │
+│  Web / CLI / API / Chat                                             │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          API 网关层                                  │
+│  FastAPI (bigmem-api)                                               │
+│  - 认证 / 限流 / 路由                                                │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   写入流程      │  │   召回流程      │  │   关联流程      │
+├─────────────────┤  ├─────────────────┤  ├─────────────────┤
+│ 1. 接收数据    │  │ 1. 理解查询    │  │ 1. 自动建立    │
+│ 2. 元数据提取  │  │ 2. 多路召回    │  │ 2. 验证关联    │
+│ 3. 向量生成    │  │ 3. 融合排序    │  │ 3. 图更新      │
+│ 4. 存储 PG    │  │ 4. 返回结果    │  │ 4. 统计更新    │
+│ 5. Kafka 通知 │  │                 │  │                 │
+└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+         │                    │                    │
+         ▼                    │                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         消息队列 (Kafka)                             │
+│  memory_events | file_events | link_events | todo_events            │
+└─────────────────────────────────────────────────────────────────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ 消费:           │  │ 消费:           │  │ 消费:          │
+│ - ES 索引       │  │ - Redis 缓存    │  │ - Neo4j 图     │
+│ - Neo4j 图      │  │ - 相关计算      │  │ - 索引更新     │
+│ - Redis 缓存    │  │                 │  │                │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+10. 关键实现细节
+10.1 提炼任务 (每周/每月)
+# 定时任务: 每周日 02:00
+任务: weekly_refine
+流程:
+  1. 获取过去7天的 raw_daily 记忆
+  2. 使用 LLM 提炼:
+     prompt: """
+     从以下7天的记忆片段中提炼出核心要点:
+     {{ memory_contents }}
+     
+     输出格式:
+     {
+       "summary": "一句话总结",
+       "key_points": ["要点1", "要点2"],
+       "insights": "洞察/洞见",
+       "tags": ["标签1", "标签2"]
+     }
+     """
+  3. 生成提炼记忆:
+     - atom_type = refined_weekly
+     - refined_period = weekly_2026_12
+     - refined_from = [day_memory_ids]
+  4. 自动建立关联:
+     - derived: 提炼 → 7个原始记忆
+     - related: 链接到相关的经验教训
+10.2 经验教训自动生成
+触发场景:
+  - 待办完成时 (status: pending → completed)
+  - 用户标记 "这是教训"
+  - 重复错误检测
+
+生成流程:
+  1. 收集上下文:
+     - 待办相关记忆
+     - 关联项目
+     - 错误日志/排查记录
+  2. LLM 生成简短教训:
+     prompt: """
+     基于以下背景生成一条简短的经验教训 (建议30-50字):
+     
+     待办: {{ todo_title }}
+     完成时间: {{ completed_at }}
+     关联记忆: {{ related_memories }}
+     
+     格式: "[类别] 教训内容"
+     示例: "[部署] 使用 docker-compose up -d --build 而非直接 up"
+     """
+  3. 存储到 lessons 表
+  4. 关联到源记忆/待办/项目
+11. 查询场景示例
+场景1: "帮我找上次那个8GB的三体视频"
+召回过程:
+1. 理解查询:
+   - 实体: "三体" (keyword), "8GB" (size: 7-9GB), "视频" (type: video)
+   - 意图: recall_file
+   
+2. 多路召回:
+   - 语义向量: file_embedding <=> '三体电影视频' → top 20
+   - 关键词: filename ILIKE '%三体%' AND format IN (mp4,mkv) → top 20
+   - 元数据: file_size BETWEEN 7GB AND 9GB → top 10
+   - 关系图: 搜索关联了"三体"标签的记忆 → 获取关联文件
+
+3. 融合排序:
+   - 同时命中 关键词+语义+大小 → 最高分
+   - 返回结果:
+     [
+       {
+         "filename": "三体.mp4",
+         "file_size": 8589934592 (≈8GB),
+         "resolution": "1920x1080",
+         "duration": "2h 26m",
+         "score": 0.95,
+         "stored_path": "minio://videos/santi_20260319.mp4"
+       }
+     ]
+场景2: "上次部署的错误后来怎么解决的?"
+召回过程:
+1. 理解查询:
+   - 实体: "部署", "错误"
+   - 意图: verify_memory (验证/追踪)
+
+2. 查找记忆:
+   - 搜索: content CONTAINS '部署' AND '错误'
+   - 找到: memory_001 "部署时数据库连接失败"
+
+3. 查找关联待办:
+   - MATCH (m)-[:TRIGGERED]->(t:Todo)
+   - 找到: todo_001 "修复数据库连接问题"
+
+4. 验证状态:
+   - todo_001.status = 'completed'
+   - todo_001.completed_at = '2026-03-15 14:30'
+
+5. 返回:
+   {
+     "verified": true,
+     "memory": "部署时数据库连接失败",
+     "todo": "修复数据库连接问题",
+     "status": "已完成",
+     "completed_at": "2026-03-15 14:30",
+     "solution": "修改了 .env 中的 DATABASE_URL"
+   }
+12. 扩展性设计
+12.1 多模态支持
+类型	向量模型	说明
+文本	text-embedding-3-small	通用文本
+图片	Qwen-VL-Chat	图像理解
+音频	Whisper + audio-embedding	语音转写+向量
+视频	关键帧提取 + Qwen-VL	抽取关键帧→向量
+文档	PDF/PPT 解析 + 文本向量	结构化提取
+12.2 增量扩展
+当前: 
+  memory_atoms + file_metadata → 统一召回
+
+未来扩展:
+  ┌─────────────────────────────────────────────────────────────┐
+  │                     新增实体类型                            │
+  ├──────────────┬──────────────┬──────────────┬──────────────┤
+  │  contacts    │  locations   │  events      │  credentials │
+  │  联系人      │  地点        │  日程事件    │  凭证/密码   │
+  └──────────────┴──────────────┴──────────────┴──────────────┘
+                              │
+                              ▼
+                    统一纳入融合召回
+13. 实施路线图
+Phase 1: 基础建设 (2周)
+扩展 PostgreSQL 表结构 (新增 links, todos, lessons, file_metadata)
+Kafka Topic 创建与配置
+基础 API 端点实现
+Phase 2: 召回引擎 (2周)
+Elasticsearch 索引设计 (IK 分词)
+多路召回实现 (语义+关键词+图+元数据)
+融合排序算法
+Phase 3: 智能化 (2周)
+元数据自动提取 (LLM + ffprobe)
+每周/每月提炼任务
+经验教训自动生成
+Phase 4: 优化 (1周)
+性能优化 (缓存、异步)
+召回效果调优
+文档与测试
+14. 总结
+这个设计方案解决了你的核心需求：
+
+需求	方案
+记忆召回完整性	多路召回 (向量+关键词+图+元数据)
+记忆准确性	融合排序 + 交叉验证
+记忆连续性	层级关联 (日→周→月) + 时间链
+记忆关联性	Neo4j 知识图谱 + 双向索引
+待办关联	trigger/verified 双向链接
+项目文档	独立表 + 关联检索
+经验教训	lessons 表 + 源头追溯
+非结构化数据	file_metadata + 自动元数据 + 统一召回
+核心逻辑已打通: 每日记忆 → 提炼记忆 → 经验教训，这三者通过 memory_links 表实现双向可追溯关联。
